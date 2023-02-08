@@ -169,11 +169,55 @@ int main(void) {
         }
 
 #if defined(SAMD21)
+    // First, check for voltage too low, and set up brownout protection.
+    // Code largely taken from https://blog.thea.codes/sam-d21-brown-out-detector/ (thanks!)
+
+    // Disable the brown-out detector during configuration, otherwise
+    // it might misbehave and reset the microcontroller.
+    SYSCTRL->BOD33.bit.ENABLE = 0;
+    while (!SYSCTRL->PCLKSR.bit.B33SRDY) {};
+
+    // Configure the brown-out detector so that the program can use it to watch the power supply voltage.
+    SYSCTRL->BOD33.reg = (
+        // This sets the minimum voltage level to about 2.9V. See datasheet table 37-21.
+        // Voltage threshold is about 1.5V + LEVEL * 34mV. See "Electrical Characteristics" in datasheet.
+        // 39 is about 2.8V, and is a standard measured value in the datasheet.
+        // External flash chips usually require at least 2.7V.
+        SYSCTRL_BOD33_LEVEL(39) |
+        // Since the program is waiting for the voltage to rise,
+        // don't reset the microcontroller if the voltage is too low.
+        SYSCTRL_BOD33_ACTION_NONE |
+        // Enable hysteresis to better deal with noisy power supplies and voltage transients.
+        SYSCTRL_BOD33_HYST);
+
+    // Enable the brown-out detector and then wait for the voltage level to settle.
+    SYSCTRL->BOD33.bit.ENABLE = 1;
+    while (!SYSCTRL->PCLKSR.bit.BOD33RDY) {}
+
+    // BOD33DET is set when the voltage is *too low*, so wait for it to be cleared.
+    while (SYSCTRL->PCLKSR.bit.BOD33DET) {}
+
+    // Let the brown-out detector automatically reset the microcontroller if the voltage drops too low.
+    SYSCTRL->BOD33.bit.ENABLE = 0;
+    while (!SYSCTRL->PCLKSR.bit.B33SRDY) {};
+
+    SYSCTRL->BOD33.reg |= SYSCTRL_BOD33_ACTION_RESET;
+    SYSCTRL->BOD33.bit.ENABLE = 1;
+
+    // Now the voltage is OK. Check the fuses.
+
     // If fuses have been reset to all ones, the watchdog ALWAYS-ON is
     // set, so we can't turn off the watchdog.  Set the fuse to a
     // reasonable value and reset. This is a mini version of the fuse
     // reset code in selfmain.c.
-    if (((uint32_t *)NVMCTRL_AUX0_ADDRESS)[0] == 0xffffffff) {
+    const uint32_t fuses0 = ((uint32_t *)NVMCTRL_AUX0_ADDRESS)[0];
+    const uint32_t fuses1 = ((uint32_t *)NVMCTRL_AUX0_ADDRESS)[1];
+    const bool fuses0_all_ones = fuses0 == 0xffffffff;
+    const uint32_t current_bootprot = (fuses0 & NVMCTRL_FUSES_BOOTPROT_Msk) >> NVMCTRL_FUSES_BOOTPROT_Pos;
+    const bool bootprot_wrong = current_bootprot != 0x2;
+
+    // Rewrite the fuses if the first fuse word has been erased, or the BOOTPROT is wrong.
+    if (fuses0_all_ones || bootprot_wrong) {
         // Clear any error flags.
         NVMCTRL->STATUS.reg |= NVMCTRL_STATUS_MASK;
         // Turn off cache and put in manual mode.
@@ -186,10 +230,19 @@ int main(void) {
         // Clear page buffer.
         NVMCTRL->CTRLA.reg = NVMCTRL_CTRLA_CMDEX_KEY | NVMCTRL_CTRLA_CMD_PBC;
 	while (!(NVMCTRL->INTFLAG.bit.READY)) {}
-        // Reasonable fuse values, including 8k BOOTPROT.
-        ((uint32_t *)NVMCTRL_AUX0_ADDRESS)[0] = 0xD8E0C7FA;
-        ((uint32_t *)NVMCTRL_AUX0_ADDRESS)[1] = 0xFFFFFC5D;
-        // Write the fuses
+
+        if (fuses0_all_ones) {
+            // Reasonable fuse values, including 8k BOOTPROT.
+            ((uint32_t *)NVMCTRL_AUX0_ADDRESS)[0] = 0xD8E0C7FA;
+            ((uint32_t *)NVMCTRL_AUX0_ADDRESS)[1] = 0xFFFFFC5D;
+        } else {
+            // If just the BOOTPROT is wrong, change only its value.
+            ((uint32_t *)NVMCTRL_AUX0_ADDRESS)[0] =
+                (fuses0 & ~NVMCTRL_FUSES_BOOTPROT_Msk) | NVMCTRL_FUSES_BOOTPROT(0x2);
+            ((uint32_t *)NVMCTRL_AUX0_ADDRESS)[1] = fuses1;
+        }
+
+        // Write the fuses.
 	NVMCTRL->CTRLA.reg = NVMCTRL_CTRLA_CMDEX_KEY | NVMCTRL_CTRLA_CMD_WAP;
 	while (!(NVMCTRL->INTFLAG.bit.READY)) {}
         resetIntoBootloader();
